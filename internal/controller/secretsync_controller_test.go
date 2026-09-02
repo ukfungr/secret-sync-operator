@@ -33,9 +33,15 @@ import (
 	"github.com/ukfungr/secret-sync-operator/internal/provider"
 )
 
+const (
+	testTargetSecretName = "test-target-secret"
+	usernameKey          = "username"
+	passwordKey          = "password"
+)
+
 type FakeSecretProvider struct {
 	Data map[string][]byte
-	Err error
+	Err  error
 }
 
 func (f *FakeSecretProvider) GetSecret(
@@ -87,7 +93,7 @@ var _ = Describe("SecretSync Controller", func() {
 							Name: "test-secret",
 						},
 						Target: opsv1alpha1.TargetSpec{
-							Name: "test-target-secret",
+							Name: testTargetSecretName,
 						},
 					},
 				}
@@ -108,7 +114,7 @@ var _ = Describe("SecretSync Controller", func() {
 			err = k8sClient.Get(
 				ctx,
 				types.NamespacedName{
-					Name: "test-target-secret",
+					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
 				targetSecret,
@@ -119,14 +125,14 @@ var _ = Describe("SecretSync Controller", func() {
 				Expect(k8sClient.Delete(ctx, targetSecret)).To(Succeed())
 			}
 		})
-		
+
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 
 			fakeProvider := &FakeSecretProvider{
 				Data: map[string][]byte{
-					"username": []byte("admin"),
-					"password": []byte("new-password"),
+					usernameKey: []byte("admin"),
+					passwordKey: []byte("new-password"),
 				},
 			}
 
@@ -150,18 +156,17 @@ var _ = Describe("SecretSync Controller", func() {
 			Expect(k8sClient.Get(
 				ctx,
 				types.NamespacedName{
-					Name:      "test-target-secret",
+					Name:      testTargetSecretName,
 					Namespace: typeNamespacedName.Namespace,
 				},
 				&targetSecret,
 			)).To(Succeed())
 
 			Expect(targetSecret.Data).To(Equal(map[string][]byte{
-				"username": []byte("admin"),
-				"password": []byte("new-password"),
+				usernameKey: []byte("admin"),
+				passwordKey: []byte("new-password"),
 			}))
 
-			
 			// Test SecretSync status
 
 			var updatedSecretSync opsv1alpha1.SecretSync
@@ -171,19 +176,18 @@ var _ = Describe("SecretSync Controller", func() {
 				typeNamespacedName,
 				&updatedSecretSync,
 			)).To(Succeed())
-			
+
 			Expect(updatedSecretSync.Status.Conditions).To(HaveLen(1))
 
 			condition := updatedSecretSync.Status.Conditions[0]
-			
-			/** Current condition fields
-			Type:               Ready
-			Status:             True
-			ObservedGeneration: 1
-			LastTransitionTime: 2026-08-28... 
-			Reason:              SecretSynced
-			Message:             Secret successfully synchronized 
-			*/
+
+			// Current condition fields:
+			// 		Type:               Ready
+			//		Status:             True
+			//		ObservedGeneration: 1
+			//		LastTransitionTime: 2026-08-28...
+			//		Reason:              SecretSynced
+			//		Message:             Secret successfully synchronized
 			Expect(condition.Type).To(Equal("Ready"))
 			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
 			Expect(condition.Reason).To(Equal("SecretSynced"))
@@ -196,12 +200,12 @@ var _ = Describe("SecretSync Controller", func() {
 
 			targetSecret := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-target-secret",
+					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
 				Data: map[string][]byte{
-					"username": []byte("admin"),
-					"password": []byte("new-password"),
+					usernameKey: []byte("admin"),
+					passwordKey: []byte("new-password"),
 				},
 			}
 
@@ -211,8 +215,8 @@ var _ = Describe("SecretSync Controller", func() {
 
 			fakeProvider := &FakeSecretProvider{
 				Data: map[string][]byte{
-					"username": []byte("admin"),
-					"password": []byte("new-password"),
+					usernameKey: []byte("admin"),
+					passwordKey: []byte("new-password"),
 				},
 			}
 
@@ -241,15 +245,15 @@ var _ = Describe("SecretSync Controller", func() {
 			Expect(k8sClient.Get(
 				ctx,
 				types.NamespacedName{
-					Name:      "test-target-secret",
+					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
 				&result,
 			)).To(Succeed())
 
 			Expect(result.Data).To(Equal(map[string][]byte{
-				"username": []byte("admin"),
-				"password": []byte("new-password"),
+				usernameKey: []byte("admin"),
+				passwordKey: []byte("new-password"),
 			}))
 
 			By("verifying the SecretSync status")
@@ -277,12 +281,12 @@ var _ = Describe("SecretSync Controller", func() {
 
 			targetSecret := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-target-secret",
+					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
 				Data: map[string][]byte{
-					"username": []byte("old-user"),
-					"password": []byte("old-password"),
+					usernameKey: []byte("old-user"),
+					passwordKey: []byte("old-password"),
 				},
 			}
 
@@ -292,8 +296,8 @@ var _ = Describe("SecretSync Controller", func() {
 
 			fakeProvider := &FakeSecretProvider{
 				Data: map[string][]byte{
-					"username": []byte("admin"),
-					"password": []byte("new-password"),
+					usernameKey: []byte("admin"),
+					passwordKey: []byte("new-password"),
 				},
 			}
 
@@ -322,15 +326,15 @@ var _ = Describe("SecretSync Controller", func() {
 			Expect(k8sClient.Get(
 				ctx,
 				types.NamespacedName{
-					Name:      "test-target-secret",
+					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
 				&result,
 			)).To(Succeed())
 
 			Expect(result.Data).To(Equal(map[string][]byte{
-				"username": []byte("admin"),
-				"password": []byte("new-password"),
+				usernameKey: []byte("admin"),
+				passwordKey: []byte("new-password"),
 			}))
 
 			By("verifying the SecretSync status")
@@ -434,7 +438,7 @@ var _ = Describe("SecretSync Controller", func() {
 				typeNamespacedName,
 				&updatedSecretSync,
 			)).To(Succeed())
-			
+
 			Expect(updatedSecretSync.Status.Conditions).To(HaveLen(1))
 
 			condition := updatedSecretSync.Status.Conditions[0]

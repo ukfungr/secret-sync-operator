@@ -33,4 +33,3 @@ func TestAWSProviderWithLocalStack(t *testing.T) {
 		"password": []byte("new-password"),
 	}))
 }
-

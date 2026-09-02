@@ -10,7 +10,7 @@ type Factory interface {
 // ProviderFactory creates SecretProvider implementations.
 type ProviderFactory struct{}
 
-// GetProvider returns a SecretProvider for the specified provider type. 
+// GetProvider returns a SecretProvider for the specified provider type.
 // It returns an error if the provider type is not supported.
 func (f *ProviderFactory) GetProvider(providerType string) (SecretProvider, error) {
 

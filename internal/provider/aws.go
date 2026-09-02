@@ -16,7 +16,7 @@ type AWSProvider struct {
 	client secretsManagerClient
 }
 
-// secretsManagerClient defines the AWS Secrets Manager operations 
+// secretsManagerClient defines the AWS Secrets Manager operations
 // required by AWSProvider.
 type secretsManagerClient interface {
 	GetSecretValue(
@@ -26,11 +26,11 @@ type secretsManagerClient interface {
 	) (*secretsmanager.GetSecretValueOutput, error)
 }
 
-// NewAWSProvider creates an AWS Secrets Manager provider using the 
+// NewAWSProvider creates an AWS Secrets Manager provider using the
 // AWS configuration available in the environment.
 func NewAWSProvider() (*AWSProvider, error) {
 
-	// Load the AWS configuration using the standard AWS SDK credential 
+	// Load the AWS configuration using the standard AWS SDK credential
 	// and region resolution mechanisms.
 	cfg, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
@@ -44,11 +44,11 @@ func NewAWSProvider() (*AWSProvider, error) {
 	// such as LocalStack, for local development or testing.
 	//
 	// If an alternative endpoint is not needed, this option can be removed.
-	options := func (o *secretsmanager.Options)  {
+	options := func(o *secretsmanager.Options) {
 		if endpoint := os.Getenv("AWS_ENDPOINT_URL"); endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
 		}
-		
+
 	}
 
 	return &AWSProvider{
@@ -56,10 +56,10 @@ func NewAWSProvider() (*AWSProvider, error) {
 	}, nil
 }
 
-// GetSecret retrieves a secret from AWS Secrets Manager and converts 
+// GetSecret retrieves a secret from AWS Secrets Manager and converts
 // its JSON fields into the format expected by the SecretProvider interface.
 func (p *AWSProvider) GetSecret(
-	ctx context.Context, 
+	ctx context.Context,
 	key string,
 ) (map[string][]byte, error) {
 
@@ -101,7 +101,7 @@ func (p *AWSProvider) GetSecret(
 		)
 	}
 
-	// 4. Convert the JSON values to []byte so they can be stored 
+	// 4. Convert the JSON values to []byte so they can be stored
 	// in a Kubernetes Secret.
 	data := make(map[string][]byte, len(secretData))
 

@@ -106,7 +106,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			err.Error(),
 		)
 		if statusErr != nil {
-			return  ctrl.Result{}, statusErr
+			return ctrl.Result{}, statusErr
 		}
 
 		return ctrl.Result{}, err
@@ -137,7 +137,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			// Update SecretSync status in case it succeded creating Kubernetes secret
+			// Update SecretSync status in case it succeeded creating Kubernetes secret
 			err := r.setCondition(
 				ctx,
 				&secretSync,
@@ -179,7 +179,7 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	// Update SecretSync status in case the secret update succeded
+	// Update SecretSync status in case the secret update succeeded
 	err = r.setCondition(
 		ctx,
 		&secretSync,

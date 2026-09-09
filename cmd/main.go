@@ -177,7 +177,9 @@ func main() {
 		os.Exit(1)
 	}
 
-	providerFactory := &provider.ProviderFactory{}
+	providerFactory := &provider.ProviderFactory{
+		Client: mgr.GetClient(),
+	}
 
 	if err := (&controller.SecretSyncReconciler{
 		Client:          mgr.GetClient(),

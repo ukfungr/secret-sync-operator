@@ -36,6 +36,9 @@ type SecretSyncSpec struct {
 type ProviderSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Type string `json:"type"`
+
+	// +optional
+	Config runtime.RawExtension `json:"config,omitempty"`
 }
 
 type RemoteSpec struct {

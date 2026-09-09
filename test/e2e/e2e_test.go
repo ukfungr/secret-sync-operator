@@ -20,11 +20,12 @@ limitations under the License.
 package e2e
 
 import (
+	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -33,318 +34,702 @@ import (
 	"github.com/ukfungr/secret-sync-operator/test/utils"
 )
 
-// namespace where the project is deployed in
-const namespace = "secret-sync-operator-system"
-
-// serviceAccountName created for the project
-const serviceAccountName = "secret-sync-operator-controller-manager"
-
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "secret-sync-operator-controller-manager-metrics-service"
-
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "secret-sync-operator-metrics-binding"
-
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
-
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
-	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("creating AWS credentials secret")
-		cmd = exec.Command(
-			"kubectl", "create", "secret", "generic",
-			"localstack-aws-credentials",
-			"-n", namespace,
-			"--from-literal=AWS_ACCESS_KEY_ID=test",
-			"--from-literal=AWS_SECRET_ACCESS_KEY=test",
-		)
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create AWS credentials secret")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
-	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
-	})
-
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
+var _ = Describe("SecretSync", Ordered, func() {
 	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
-		}
+		cleanupSecretSyncResources()
 	})
 
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
+	It("should synchronize a Vault secret into a new Kubernetes Secret", func() {
+		By("creating the Vault token Secret")
 
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				By("getting the name of the controller-manager pod")
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
+		tokenSecretManifest := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token
+  namespace: secret-sync-operator-system
+type: Opaque
+stringData:
+  token: dev-only-token
+`
 
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
+		manifestPath := filepath.Join(GinkgoT().TempDir(), "vault-token.yaml")
+		err := os.WriteFile(
+			manifestPath,
+			[]byte(tokenSecretManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
 
-				By("validating the pod's status")
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
-		})
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
 
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=secret-sync-operator-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
+		By("creating the SecretSync resource")
+
+		secretSyncManifest := `
+apiVersion: ops.example.com/v1alpha1
+kind: SecretSync
+metadata:
+  name: vault-secret-sync
+  namespace: secret-sync-operator-system
+spec:
+  provider:
+    type: vault
+    config:
+      address: http://vault.secret-sync-operator-vault.svc.cluster.local:8200
+      mount: secret
+      auth:
+        type: token
+        tokenSecretRef:
+          name: vault-token
+  remote:
+    name: test-secret
+  target:
+    name: vault-synced-secret
+`
+
+		manifestPath = filepath.Join(GinkgoT().TempDir(), "vault-secret-sync.yaml")
+		err = os.WriteFile(
+			manifestPath,
+			[]byte(secretSyncManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the target Secret to be created")
+
+		Eventually(func() error {
+			_, err := utils.Run(
+				exec.Command(
+					"kubectl",
+					"get",
+					"secret",
+					"vault-synced-secret",
+					"-n",
+					"secret-sync-operator-system",
+				),
 			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
+			return err
+		}, 2*time.Minute, 2*time.Second).Should(Succeed())
 
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
+		By("checking the synchronized Secret data")
 
-			By("getting the service account token")
-			token, err := serviceAccountToken()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
+		output, err := utils.Run(
+			exec.Command(
+				"kubectl",
+				"get",
+				"secret",
+				"vault-synced-secret",
+				"-n",
+				"secret-sync-operator-system",
+				"-o",
+				"json",
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
 
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
+		var secret struct {
+			Data map[string]string `json:"data"`
+		}
+
+		Expect(json.Unmarshal([]byte(output), &secret)).To(Succeed())
+
+		username, err := base64.StdEncoding.DecodeString(secret.Data["username"])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(username)).To(Equal("admin"))
+
+		password, err := base64.StdEncoding.DecodeString(secret.Data["password"])
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(password)).To(Equal("new-password"))
+
+		By("waiting for SecretSync to report Ready")
+
+		Eventually(func() bool {
+			output, err := utils.Run(
+				exec.Command(
+					"kubectl",
+					"get",
+					"secretsync",
+					"vault-secret-sync",
+					"-n",
+					"secret-sync-operator-system",
+					"-o",
+					"json",
+				),
+			)
+			if err != nil {
+				return false
 			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
 
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
+			var secretSync struct {
+				Status struct {
+					Conditions []struct {
+						Type    string `json:"type"`
+						Status  string `json:"status"`
+						Reason  string `json:"reason"`
+						Message string `json:"message"`
+					} `json:"conditions"`
+				} `json:"status"`
 			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
 
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
-
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
-							],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
-
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
+			if err := json.Unmarshal([]byte(output), &secretSync); err != nil {
+				return false
 			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
 
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
+			for _, condition := range secretSync.Status.Conditions {
+				if condition.Type == "Ready" &&
+					condition.Status == "True" &&
+					condition.Reason == "SecretSynced" {
+					return true
+				}
 			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
-		})
 
-		// +kubebuilder:scaffold:e2e-webhooks-checks
+			return false
+		}, 2*time.Minute, 2*time.Second).Should(BeTrue())
+	})
 
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
+	It("should update an existing Kubernetes Secret when the Vault secret changes", func() {
+		By("creating the Vault token Secret")
+
+		tokenSecretManifest := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token-update
+  namespace: secret-sync-operator-system
+type: Opaque
+stringData:
+  token: dev-only-token
+`
+
+		manifestPath := filepath.Join(GinkgoT().TempDir(), "vault-token-update.yaml")
+		err := os.WriteFile(
+			manifestPath,
+			[]byte(tokenSecretManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating the existing target Secret with old data")
+
+		targetSecretManifest := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-update-target
+  namespace: secret-sync-operator-system
+type: Opaque
+stringData:
+  username: old-user
+  password: old-password
+`
+
+		manifestPath = filepath.Join(GinkgoT().TempDir(), "vault-update-target.yaml")
+		err = os.WriteFile(
+			manifestPath,
+			[]byte(targetSecretManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating the SecretSync resource")
+
+		secretSyncManifest := `
+apiVersion: ops.example.com/v1alpha1
+kind: SecretSync
+metadata:
+  name: vault-update-secret-sync
+  namespace: secret-sync-operator-system
+spec:
+  provider:
+    type: vault
+    config:
+      address: http://vault.secret-sync-operator-vault.svc.cluster.local:8200
+      mount: secret
+      auth:
+        type: token
+        tokenSecretRef:
+          name: vault-token-update
+  remote:
+    name: test-secret
+  target:
+    name: vault-update-target
+`
+
+		manifestPath = filepath.Join(GinkgoT().TempDir(), "vault-update-secret-sync.yaml")
+		err = os.WriteFile(
+			manifestPath,
+			[]byte(secretSyncManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for the target Secret to contain the Vault data")
+
+		Eventually(func() bool {
+			output, err := utils.Run(
+				exec.Command(
+					"kubectl",
+					"get",
+					"secret",
+					"vault-update-target",
+					"-n",
+					"secret-sync-operator-system",
+					"-o",
+					"json",
+				),
+			)
+			if err != nil {
+				return false
+			}
+
+			var secret struct {
+				Data map[string]string `json:"data"`
+			}
+
+			if err := json.Unmarshal([]byte(output), &secret); err != nil {
+				return false
+			}
+
+			username, err := base64.StdEncoding.DecodeString(secret.Data["username"])
+			if err != nil || string(username) != "admin" {
+				return false
+			}
+
+			password, err := base64.StdEncoding.DecodeString(secret.Data["password"])
+			if err != nil || string(password) != "new-password" {
+				return false
+			}
+
+			return true
+		}, 2*time.Minute, 2*time.Second).Should(BeTrue())
+
+		By("waiting for SecretSync to report Ready")
+
+		Eventually(func() bool {
+			output, err := utils.Run(
+				exec.Command(
+					"kubectl",
+					"get",
+					"secretsync",
+					"vault-update-secret-sync",
+					"-n",
+					"secret-sync-operator-system",
+					"-o",
+					"json",
+				),
+			)
+			if err != nil {
+				return false
+			}
+
+			var secretSync struct {
+				Status struct {
+					Conditions []struct {
+						Type   string `json:"type"`
+						Status string `json:"status"`
+						Reason string `json:"reason"`
+					} `json:"conditions"`
+				} `json:"status"`
+			}
+
+			if err := json.Unmarshal([]byte(output), &secretSync); err != nil {
+				return false
+			}
+
+			for _, condition := range secretSync.Status.Conditions {
+				if condition.Type == "Ready" &&
+					condition.Status == "True" &&
+					condition.Reason == "SecretSynced" {
+					return true
+				}
+			}
+
+			return false
+		}, 2*time.Minute, 2*time.Second).Should(BeTrue())
+	})
+
+	It("should not update an existing Kubernetes Secret when it is already synchronized", func() {
+		By("creating the Vault token Secret")
+
+		tokenSecretManifest := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token-noop
+  namespace: secret-sync-operator-system
+type: Opaque
+stringData:
+  token: dev-only-token
+`
+
+		manifestPath := filepath.Join(GinkgoT().TempDir(), "vault-token-noop.yaml")
+		err := os.WriteFile(
+			manifestPath,
+			[]byte(tokenSecretManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("creating the existing target Secret with the correct data")
+
+		targetSecretManifest := `
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-noop-target
+  namespace: secret-sync-operator-system
+type: Opaque
+stringData:
+  username: admin
+  password: new-password
+`
+
+		manifestPath = filepath.Join(GinkgoT().TempDir(), "vault-noop-target.yaml")
+		err = os.WriteFile(
+			manifestPath,
+			[]byte(targetSecretManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("recording the target Secret resourceVersion")
+
+		output, err := utils.Run(
+			exec.Command(
+				"kubectl",
+				"get",
+				"secret",
+				"vault-noop-target",
+				"-n",
+				"secret-sync-operator-system",
+				"-o",
+				"json",
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		var targetSecretBefore struct {
+			Metadata struct {
+				ResourceVersion string `json:"resourceVersion"`
+			} `json:"metadata"`
+			Data map[string]string `json:"data"`
+		}
+
+		Expect(json.Unmarshal([]byte(output), &targetSecretBefore)).To(Succeed())
+
+		initialResourceVersion := targetSecretBefore.Metadata.ResourceVersion
+
+		By("creating the SecretSync resource")
+
+		secretSyncManifest := `
+apiVersion: ops.example.com/v1alpha1
+kind: SecretSync
+metadata:
+  name: vault-noop-secret-sync
+  namespace: secret-sync-operator-system
+spec:
+  provider:
+    type: vault
+    config:
+      address: http://vault.secret-sync-operator-vault.svc.cluster.local:8200
+      mount: secret
+      auth:
+        type: token
+        tokenSecretRef:
+          name: vault-token-noop
+  remote:
+    name: test-secret
+  target:
+    name: vault-noop-target
+`
+
+		manifestPath = filepath.Join(GinkgoT().TempDir(), "vault-noop-secret-sync.yaml")
+		err = os.WriteFile(
+			manifestPath,
+			[]byte(secretSyncManifest),
+			0o644,
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		_, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"apply",
+				"-f",
+				manifestPath,
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("waiting for SecretSync to report that the Secret is already synchronized")
+
+		Eventually(func() bool {
+			output, err := utils.Run(
+				exec.Command(
+					"kubectl",
+					"get",
+					"secretsync",
+					"vault-noop-secret-sync",
+					"-n",
+					"secret-sync-operator-system",
+					"-o",
+					"json",
+				),
+			)
+			if err != nil {
+				return false
+			}
+
+			var secretSync struct {
+				Status struct {
+					Conditions []struct {
+						Type    string `json:"type"`
+						Status  string `json:"status"`
+						Reason  string `json:"reason"`
+						Message string `json:"message"`
+					} `json:"conditions"`
+				} `json:"status"`
+			}
+
+			if err := json.Unmarshal([]byte(output), &secretSync); err != nil {
+				return false
+			}
+
+			for _, condition := range secretSync.Status.Conditions {
+				if condition.Type == "Ready" &&
+					condition.Status == "True" &&
+					condition.Reason == "SecretSynced" &&
+					condition.Message == "Secret is already synchronized" {
+					return true
+				}
+			}
+
+			return false
+		}, 2*time.Minute, 2*time.Second).Should(BeTrue())
+
+		By("verifying that the target Secret was not updated")
+
+		output, err = utils.Run(
+			exec.Command(
+				"kubectl",
+				"get",
+				"secret",
+				"vault-noop-target",
+				"-n",
+				"secret-sync-operator-system",
+				"-o",
+				"json",
+			),
+		)
+		Expect(err).NotTo(HaveOccurred())
+
+		var targetSecretAfter struct {
+			Metadata struct {
+				ResourceVersion string `json:"resourceVersion"`
+			} `json:"metadata"`
+			Data map[string]string `json:"data"`
+		}
+
+		Expect(json.Unmarshal([]byte(output), &targetSecretAfter)).To(Succeed())
+
+		Expect(targetSecretAfter.Metadata.ResourceVersion).
+			To(Equal(initialResourceVersion))
+
+		Expect(targetSecretAfter.Data).
+			To(Equal(targetSecretBefore.Data))
 	})
 })
 
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
+func cleanupSecretSyncResources() {
+	const namespace = "secret-sync-operator-system"
 
-	By("creating temporary file to store the token request")
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
-	if err != nil {
-		return "", err
+	secretSyncs := []string{
+		"vault-secret-sync",
+		"vault-update-secret-sync",
+		"vault-noop-secret-sync",
 	}
 
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		By("executing kubectl command to create the token")
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
+	targetSecrets := []string{
+		"vault-synced-secret",
+		"vault-update-target",
+		"vault-noop-target",
+	}
+
+	tokenSecrets := []string{
+		"vault-token",
+		"vault-token-update",
+		"vault-token-noop",
+	}
+
+	By("cleaning up SecretSync resources")
+
+	for _, name := range secretSyncs {
+		_, err := utils.Run(
+			exec.Command(
+				"kubectl",
+				"delete",
+				"secretsync",
+				name,
+				"-n",
+				namespace,
+				"--ignore-not-found",
+			),
+		)
+
+		if err != nil {
+			_, _ = GinkgoWriter.Write(
+				[]byte("warning: failed to delete SecretSync " + name + ": " + err.Error() + "\n"),
+			)
+		}
+	}
+
+	By("cleaning up target Secrets")
+
+	for _, name := range targetSecrets {
+		_, err := utils.Run(
+			exec.Command(
+				"kubectl",
+				"delete",
+				"secret",
+				name,
+				"-n",
+				namespace,
+				"--ignore-not-found",
+			),
+		)
+
+		if err != nil {
+			_, _ = GinkgoWriter.Write(
+				[]byte("warning: failed to delete target Secret " + name + ": " + err.Error() + "\n"),
+			)
+		}
+	}
+
+	By("cleaning up Vault token Secrets")
+
+	for _, name := range tokenSecrets {
+		_, err := utils.Run(
+			exec.Command(
+				"kubectl",
+				"delete",
+				"secret",
+				name,
+				"-n",
+				namespace,
+				"--ignore-not-found",
+			),
+		)
+
+		if err != nil {
+			_, _ = GinkgoWriter.Write(
+				[]byte("warning: failed to delete Vault token Secret " + name + ": " + err.Error() + "\n"),
+			)
+		}
+	}
+}
+
+var _ = Describe("Controller Manager", func() {
+	It("should be running", func() {
+		By("checking the controller manager deployment")
+
+		Eventually(func() error {
+			cmd := exec.Command(
+				"kubectl",
+				"get",
+				"deployment",
+				"secret-sync-operator-controller-manager",
+				"-n",
+				"secret-sync-operator-system",
+			)
+
+			_, err := utils.Run(cmd)
+			return err
+		}, 2*time.Minute, 2*time.Second).Should(Succeed())
+	})
+})
+
+func serviceAccountToken(namespace string) string {
+	output, err := utils.Run(
+		exec.Command(
+			"kubectl",
+			"create",
+			"token",
+			"default",
+			"-n",
 			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		By("parsing the JSON output to extract the token")
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
+		),
+	)
+	if err != nil {
+		return ""
 	}
-	Eventually(verifyTokenCreation).Should(Succeed())
 
-	return out, err
-}
-
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
-}
-
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
+	return strings.TrimSpace(output)
 }

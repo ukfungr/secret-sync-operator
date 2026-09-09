@@ -35,8 +35,7 @@ import (
 // SecretSyncReconciler reconciles a SecretSync resource.
 type SecretSyncReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
-
+	Scheme          *runtime.Scheme
 	ProviderFactory provider.Factory
 }
 
@@ -73,6 +72,8 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	// 2. Get the provider configured in the SecretSync resource.
 	secretProvider, err := r.ProviderFactory.GetProvider(
 		secretSync.Spec.Provider.Type,
+		secretSync.Spec.Provider.Config,
+		secretSync.Namespace,
 	)
 
 	if err != nil {

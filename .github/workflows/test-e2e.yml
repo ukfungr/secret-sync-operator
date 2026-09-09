@@ -32,7 +32,49 @@ jobs:
       - name: Verify kind installation
         run: kind version
 
+      - name: Start Vault
+        run: |
+          docker run -d \
+            --name vault \
+            -p 8200:8200 \
+            -e VAULT_DEV_ROOT_TOKEN_ID=dev-only-token \
+            -e VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200 \
+            hashicorp/vault:1.21 \
+            server -dev
+
+      - name: Wait for Vault
+        run: |
+          for i in {1..30}; do
+            if curl --silent --fail http://127.0.0.1:8200/v1/sys/health > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Vault did not become ready"
+          docker logs vault
+          exit 1
+
+      - name: Seed Vault test secret
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: dev-only-token
+        run: |
+          curl \
+            --header "X-Vault-Token: ${VAULT_TOKEN}" \
+            --header "Content-Type: application/json" \
+            --request POST \
+            --data '{"data":{"username":"admin","password":"new-password"}}' \
+            "${VAULT_ADDR}/v1/secret/data/test-secret"
+
       - name: Running Test e2e
         run: |
           go mod tidy
           make test-e2e
+      
+      - name: Run provider integration tests
+        env:
+          VAULT_ADDR: http://127.0.0.1:8200
+          VAULT_TOKEN: dev-only-token
+        run: |
+          go test -tags=integration ./internal/provider

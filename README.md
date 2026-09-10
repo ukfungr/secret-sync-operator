@@ -7,7 +7,7 @@ The project is built with **Go**, **Kubernetes**, and **Kubebuilder**, with a pr
 Currently supported:
 
 * **AWS Secrets Manager**
-* **HashiCorp Vault** — planned
+* **HashiCorp Vault (KV v2)** with **token authentication**
 
 ---
 
@@ -20,16 +20,19 @@ The goal is to provide a simple Kubernetes-native way to reference externally ma
 ```mermaid
 flowchart LR
     A["SecretSync CR"] --> B["SecretSync Controller"]
+
     B --> C["Provider Interface"]
 
     C --> D["AWS Secrets Manager"]
-    C -. "Future" .-> E["HashiCorp Vault"]
+    C --> E["HashiCorp Vault"]
 
     D --> F["Secret Data"]
+    E --> F
+
     F --> G["Kubernetes Secret"]
 ```
 
-The controller is designed around a provider interface so that adding another secret management system does not require changing the reconciliation logic.
+The controller is designed around a provider interface so that adding another secret management system does not require changing the core reconciliation logic.
 
 ---
 
@@ -64,15 +67,17 @@ sequenceDiagram
     participant K as Kubernetes
     participant C as Controller
     participant P as Provider
-    participant A as AWS Secrets Manager
+    participant E as External Secret Manager
 
     K->>C: SecretSync created/updated
     C->>P: GetSecret(remote.name)
-    P->>A: GetSecretValue()
-    A-->>P: Secret data
+    P->>E: Retrieve secret
+    E-->>P: Secret data
     P-->>C: Secret data
     C->>K: Create/Update target Secret
 ```
+
+If the target Secret already contains the desired data, the controller does not update it.
 
 ---
 
@@ -104,13 +109,16 @@ spec:
 
 ### Specification
 
-| Field                | Description                                      |
-| -------------------- | ------------------------------------------------ |
-| `spec.provider.type` | External secret provider to use                  |
-| `spec.remote.name`   | Name/key of the secret in the external provider  |
-| `spec.target.name`   | Name of the Kubernetes `Secret` to create/update |
+| Field                  | Description                                      |
+| ---------------------- | ------------------------------------------------ |
+| `spec.provider.type`   | External secret provider to use                  |
+| `spec.provider.config` | Optional provider-specific configuration         |
+| `spec.remote.name`     | Name/key of the secret in the external provider  |
+| `spec.target.name`     | Name of the Kubernetes `Secret` to create/update |
 
 The target Kubernetes `Secret` is created in the **same namespace as the `SecretSync` resource**.
+
+Provider configuration is passed to the provider implementation, allowing each provider to determine how its configuration and authentication should be handled.
 
 ---
 
@@ -120,6 +128,7 @@ The project separates Kubernetes reconciliation from provider-specific implement
 
 ```mermaid
 flowchart TB
+
     CR["SecretSync Custom Resource"]
 
     subgraph Operator["Secret Sync Operator"]
@@ -129,7 +138,7 @@ flowchart TB
 
     subgraph Providers["Providers"]
         AWS["AWS Provider"]
-        Vault["Vault Provider<br/>(planned)"]
+        Vault["Vault Provider"]
     end
 
     subgraph External["External Secret Managers"]
@@ -143,13 +152,13 @@ flowchart TB
     Controller --> Provider
 
     Provider --> AWS
-    Provider -.-> Vault
+    Provider --> Vault
 
     AWS --> AWS_SM
-    Vault -.-> Vault_SM
+    Vault --> Vault_SM
 
     AWS_SM --> AWS
-    Vault_SM -.-> Vault
+    Vault_SM --> Vault
 
     Provider --> Controller
     Controller --> K8S
@@ -184,6 +193,10 @@ secret-sync-operator/
 │   ├── rbac/
 │   └── samples/
 │
+├── deploy/
+│   └── vault/
+│       └── docker-compose.yml
+│
 ├── internal/
 │   ├── controller/
 │   │   ├── secretsync_controller.go
@@ -191,8 +204,20 @@ secret-sync-operator/
 │   │
 │   └── provider/
 │       ├── provider.go
+│       ├── factory.go
 │       ├── aws.go
-│       └── aws_test.go
+│       ├── aws_test.go
+│       ├── vault.go
+│       ├── vault_auth.go
+│       ├── vault_auth_test.go
+│       └── vault_integration_test.go
+│
+├── test/
+│   ├── e2e/
+│   │   ├── e2e_suite_test.go
+│   │   ├── e2e_test.go
+│   │   └── vault.go
+│   └── utils/
 │
 ├── Dockerfile
 ├── Makefile
@@ -218,9 +243,7 @@ type Provider interface {
 }
 ```
 
-The AWS implementation uses the AWS SDK for Go.
-
-Future providers can implement the same interface:
+Current implementations include:
 
 ```mermaid
 classDiagram
@@ -249,7 +272,7 @@ This keeps provider-specific code isolated from the Kubernetes controller.
 
 The current implementation supports **AWS Secrets Manager**.
 
-The AWS provider retrieves the secret using the AWS SDK for Go and expects the secret to contain a JSON object.
+The AWS provider retrieves the secret using the AWS SDK for Go and expects the secret to contain a JSON object with string values.
 
 For example, an AWS Secrets Manager secret could contain:
 
@@ -276,7 +299,6 @@ AWS Secrets Manager
   "host": "database.example.com"
 }
         │
-        │
         ▼
 Kubernetes Secret
         │
@@ -285,15 +307,113 @@ Kubernetes Secret
         └── host
 ```
 
+### AWS Configuration
+
+The AWS provider uses the standard AWS SDK credential and region resolution mechanisms.
+
+For local development and testing, the provider also supports the `AWS_ENDPOINT_URL` environment variable for directing requests to a local AWS-compatible endpoint such as LocalStack.
+
+---
+
+# HashiCorp Vault
+
+The operator supports **HashiCorp Vault KV v2**.
+
+Vault configuration is provided through `spec.provider.config`.
+
+Example:
+
+```yaml
+apiVersion: ops.example.com/v1alpha1
+kind: SecretSync
+metadata:
+  name: vault-database-sync
+  namespace: default
+spec:
+  provider:
+    type: vault
+    config:
+      address: http://vault.example.com:8200
+      mount: secret
+      auth:
+        type: token
+        tokenSecretRef:
+          name: vault-token
+  remote:
+    name: database
+  target:
+    name: database-secret
+```
+
+### Vault Configuration
+
+| Field                                      | Description                                  |
+| ------------------------------------------ | -------------------------------------------- |
+| `provider.config.address`                  | Vault server address                         |
+| `provider.config.mount`                    | KV v2 mount path                             |
+| `provider.config.auth.type`                | Vault authentication method                  |
+| `provider.config.auth.tokenSecretRef.name` | Kubernetes Secret containing the Vault token |
+
+### Token Authentication
+
+The currently implemented Vault authentication method is **token authentication**.
+
+The referenced Kubernetes Secret must contain the Vault token under the `token` key:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token
+type: Opaque
+stringData:
+  token: <vault-token>
+```
+
+The `SecretSync` then references this Secret:
+
+```yaml
+provider:
+  type: vault
+  config:
+    address: http://vault.example.com:8200
+    mount: secret
+    auth:
+      type: token
+      tokenSecretRef:
+        name: vault-token
+```
+
+Authentication handling is implemented inside the Vault provider rather than inside the Kubernetes controller. This keeps authentication mechanisms provider-specific and allows additional Vault authentication methods to be added without changing the controller reconciliation logic.
+
+### Vault Secret Format
+
+Vault KV v2 secrets can contain multiple key/value pairs.
+
+For example:
+
+```text
+secret/data/database
+```
+
+could contain:
+
+```json
+{
+  "username": "admin",
+  "password": "example-password"
+}
+```
+
+The operator converts the Vault data into the Kubernetes Secret's `data` fields.
+
 ---
 
 # Current Limitations
 
-The current AWS provider has some intentional limitations.
+### AWS Secret Format
 
-### Secret format
-
-The AWS secret must be stored as a JSON object containing string values.
+The AWS provider currently expects `SecretString` to contain a JSON object with string values.
 
 For example:
 
@@ -304,23 +424,31 @@ For example:
 }
 ```
 
-### `SecretBinary`
+### AWS `SecretBinary`
 
 The current implementation supports `SecretString`.
 
 `SecretBinary` is not currently supported.
 
-### Authentication
+### AWS Authentication
 
-Local development currently uses credentials configured for the LocalStack environment.
+The AWS provider relies on the standard AWS SDK credential resolution mechanisms.
 
-Production authentication mechanisms such as AWS IAM roles for service accounts/workload identity can be added as part of a production deployment configuration.
+For local testing, dummy credentials can be used when connecting to LocalStack.
 
-### Providers
+Production deployments should use an appropriate AWS authentication mechanism such as workload identity or IAM-based credentials rather than static credentials.
 
-Currently only AWS Secrets Manager is implemented.
+### Vault Authentication
 
-HashiCorp Vault support is planned.
+Vault currently supports token authentication.
+
+Additional Vault authentication methods are planned.
+
+### Secret Ownership
+
+The operator does not set an owner reference from the target Kubernetes Secret to the `SecretSync` resource.
+
+The `SecretSync` resource describes the target Secret, but the target Secret remains independently managed as a Kubernetes resource.
 
 ---
 
@@ -334,6 +462,10 @@ For local development, you will need:
 * **Kind**
 * **AWS CLI** — required for interacting with the LocalStack AWS APIs
 * **LocalStack** — required for the local AWS integration test
+
+For Vault development and testing, you will also need:
+
+* **Vault** or the provided Docker Compose environment
 
 You should also have a Kubernetes cluster available for deploying the operator.
 
@@ -375,7 +507,6 @@ LocalStack is used to provide a local AWS Secrets Manager environment without re
 ```mermaid
 flowchart LR
     Test["Integration Test"] --> LS["LocalStack"]
-    Controller["Secret Sync Controller"] --> LS
     LS --> SM["Secrets Manager API"]
 ```
 
@@ -402,9 +533,7 @@ aws secretsmanager get-secret-value \
   --region us-east-1
 ```
 
-For LocalStack, dummy AWS credentials can be used because no real AWS credentials are required.
-
-For example:
+For LocalStack, dummy AWS credentials can be used because no real AWS credentials are required:
 
 ```bash
 export AWS_ACCESS_KEY_ID=test
@@ -412,7 +541,69 @@ export AWS_SECRET_ACCESS_KEY=test
 export AWS_DEFAULT_REGION=us-east-1
 ```
 
-> **Note:** The LocalStack endpoint configuration in the AWS provider is intended for local development and testing. Production deployments should use the standard AWS endpoint configuration.
+The AWS provider can be configured to use the LocalStack endpoint with:
+
+```bash
+export AWS_ENDPOINT_URL=http://localhost:4566
+```
+
+> **Note:** The LocalStack endpoint configuration is intended for local development and testing. Production deployments should use the standard AWS endpoint.
+
+---
+
+# Local Vault
+
+A Docker Compose configuration is provided for running Vault locally.
+
+The configuration is located at:
+
+```text
+deploy/vault/docker-compose.yml
+```
+
+Start Vault:
+
+```bash
+docker compose -f deploy/vault/docker-compose.yml up -d
+```
+
+The development Vault instance is available at:
+
+```text
+http://localhost:8200
+```
+
+The local development configuration uses:
+
+```text
+VAULT_ADDR=http://localhost:8200
+VAULT_TOKEN=dev-only-token
+```
+
+The development Vault uses the `secret` KV v2 mount.
+
+For example:
+
+```bash
+export VAULT_ADDR=http://localhost:8200
+export VAULT_TOKEN=dev-only-token
+```
+
+Create a test secret:
+
+```bash
+vault kv put secret/test-secret \
+  username=admin \
+  password=new-password
+```
+
+Run the Vault integration tests:
+
+```bash
+go test -tags=integration ./internal/provider
+```
+
+> **Note:** The development Vault configuration uses a development-only root token. Do not use this configuration or token in production.
 
 ---
 
@@ -466,35 +657,19 @@ You should see the controller pod running.
 You can also inspect the controller logs:
 
 ```bash
-kubectl logs -n secret-sync-operator-system deployment/secret-sync-controller-manager
+kubectl logs -n secret-sync-operator-system \
+  deployment/secret-sync-operator-controller-manager
 ```
 
-> The exact namespace and deployment name may vary depending on the project configuration.
-
----
-
-# LocalStack AWS Credentials
-
-When running the controller locally with LocalStack, configure the controller deployment with the LocalStack credentials.
-
-The credentials are intentionally fake:
-
-```text
-AWS_ACCESS_KEY_ID=test
-AWS_SECRET_ACCESS_KEY=test
-```
-
-They are only used to authenticate against LocalStack.
-
-**Do not use these credentials for real AWS resources.**
-
-For a production AWS deployment, the operator should use an appropriate AWS authentication mechanism instead of static credentials.
+> The exact deployment name may vary depending on the project configuration.
 
 ---
 
 # Create a SecretSync
 
-Create a `SecretSync` resource:
+Create a `SecretSync` resource.
+
+For AWS:
 
 ```yaml
 apiVersion: ops.example.com/v1alpha1
@@ -530,6 +705,71 @@ kubectl get secret database-secret
 
 ---
 
+# Create a Vault SecretSync
+
+First create a Kubernetes Secret containing the Vault token:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token
+  namespace: default
+type: Opaque
+stringData:
+  token: dev-only-token
+```
+
+Apply it:
+
+```bash
+kubectl apply -f vault-token.yaml
+```
+
+Then create the `SecretSync`:
+
+```yaml
+apiVersion: ops.example.com/v1alpha1
+kind: SecretSync
+metadata:
+  name: vault-database-sync
+  namespace: default
+spec:
+  provider:
+    type: vault
+    config:
+      address: http://vault.example.com:8200
+      mount: secret
+      auth:
+        type: token
+        tokenSecretRef:
+          name: vault-token
+  remote:
+    name: test-secret
+  target:
+    name: database-secret
+```
+
+Apply it:
+
+```bash
+kubectl apply -f vault-secret-sync.yaml
+```
+
+Check the synchronization status:
+
+```bash
+kubectl get secretsync vault-database-sync -o yaml
+```
+
+Then check the target Secret:
+
+```bash
+kubectl get secret database-secret
+```
+
+---
+
 # Verify the Secret
 
 You can inspect the generated Secret:
@@ -549,30 +789,64 @@ kubectl get secret database-secret \
 
 ---
 
+# Reconciliation Behavior
+
+The controller handles three main synchronization cases.
+
+### Target Secret does not exist
+
+The operator creates the target Secret with the data retrieved from the external provider.
+
+### Target Secret exists with different data
+
+The operator updates the target Secret so that its data matches the external secret.
+
+### Target Secret already contains the desired data
+
+The operator does not update the target Secret.
+
+The `SecretSync` status reports the synchronization result using a `Ready` condition.
+
+---
+
 # End-to-End Flow
 
-Once everything is running, the complete local flow looks like this:
+For AWS:
 
 ```mermaid
 flowchart TB
     User["Developer"]
 
     User -->|"Creates SecretSync"| CR["SecretSync CR"]
+    CR --> Controller["SecretSync Controller"]
+    Controller --> Provider["AWS Provider"]
+    Provider --> LocalStack["LocalStack"]
+    LocalStack --> SecretsManager["AWS Secrets Manager API"]
+    SecretsManager --> Secret["External Secret"]
+    Secret --> Provider
+    Provider --> Controller
+    Controller --> KubernetesSecret["Kubernetes Secret"]
+```
 
+For Vault:
+
+```mermaid
+flowchart TB
+    User["Developer"]
+
+    User -->|"Creates SecretSync"| CR["SecretSync CR"]
     CR --> Controller["SecretSync Controller"]
 
-    Controller --> Provider["AWS Provider"]
+    Controller --> VaultProvider["Vault Provider"]
+    VaultProvider --> Auth["Vault Authentication"]
 
-    Provider --> LocalStack["LocalStack"]
+    Auth --> TokenSecret["Kubernetes Token Secret"]
+    VaultProvider --> Vault["HashiCorp Vault KV v2"]
 
-    LocalStack --> SecretsManager["AWS Secrets Manager API"]
+    Vault --> Secret["External Secret"]
+    Secret --> VaultProvider
 
-    SecretsManager --> Secret["External Secret"]
-
-    Secret --> Provider
-
-    Provider --> Controller
-
+    VaultProvider --> Controller
     Controller --> KubernetesSecret["Kubernetes Secret"]
 ```
 
@@ -584,7 +858,7 @@ The `SecretSync` only describes where the secret should come from and where it s
 
 # Testing
 
-Run all tests:
+Run the standard test suite:
 
 ```bash
 make test
@@ -596,13 +870,43 @@ Or:
 go test ./...
 ```
 
-The provider package contains unit tests for the AWS implementation.
+The provider package contains unit tests for the AWS and Vault implementations.
 
 The AWS provider uses an interface around the AWS Secrets Manager client so that the provider can be tested without requiring a real AWS environment.
 
-The project also includes a LocalStack integration test for testing the AWS Secrets Manager interaction locally.
+Vault authentication has dedicated unit tests, and Vault secret retrieval has an integration test using a real Vault development instance.
 
-If LocalStack is not running, the LocalStack integration test should be skipped.
+### Vault Integration Tests
+
+With Vault running locally:
+
+```bash
+export VAULT_ADDR=http://localhost:8200
+export VAULT_TOKEN=dev-only-token
+
+go test -tags=integration ./internal/provider
+```
+
+### End-to-End Tests
+
+The project also includes Kind-based E2E tests.
+
+Run them with:
+
+```bash
+make test-e2e
+```
+
+The E2E suite creates an isolated Kind cluster, deploys the operator, starts Vault inside the cluster, seeds a test Vault secret, and verifies the complete synchronization flow.
+
+The E2E tests cover:
+
+* Creating a Kubernetes Secret from a Vault secret.
+* Updating an existing Kubernetes Secret when the Vault data changes.
+* Avoiding an unnecessary update when the target Secret is already synchronized.
+* Verifying that the controller manager is running.
+
+The E2E workflow is also executed through GitHub Actions.
 
 ---
 
@@ -654,9 +958,9 @@ The basic flow is:
 flowchart LR
     Source["Git Repository"] --> Build["Build Docker Image"]
     Build --> Image["Controller Image"]
-    Image --> Kind["Kubernetes Cluster"]
+    Image --> Cluster["Kubernetes Cluster"]
     Source --> Manifests["Kubernetes Manifests"]
-    Manifests --> Kind
+    Manifests --> Cluster
 ```
 
 A future release can publish versioned container images to a container registry.
@@ -676,7 +980,7 @@ This would allow users to deploy the operator without building the image themsel
 
 Planned improvements include:
 
-* [ ] Add HashiCorp Vault provider
+* [ ] Add additional HashiCorp Vault authentication methods
 * [ ] Improve provider configuration
 * [ ] Add stronger reconciliation/status reporting
 * [ ] Improve error handling and retry behavior
@@ -703,12 +1007,14 @@ It provides experience with:
 * **Kubernetes reconciliation**
 * **AWS Secrets Manager**
 * **AWS SDK for Go**
+* **HashiCorp Vault**
+* **Vault KV v2**
 * **Docker**
 * **Kind**
 * **LocalStack**
 * **Kubernetes RBAC**
 * **Provider abstractions**
-* **Unit and integration testing**
+* **Unit, integration, and E2E testing**
 
 The project also demonstrates how external infrastructure services can be integrated into Kubernetes through a custom controller.
 
@@ -732,7 +1038,3 @@ Before submitting changes, make sure the project builds successfully and the tes
 ```bash
 make test
 ```
-
-
-
-

@@ -19,20 +19,120 @@ The goal is to provide a simple Kubernetes-native way to reference externally ma
 
 ```mermaid
 flowchart LR
+
     A["SecretSync CR"] --> B["SecretSync Controller"]
 
     B --> C["Provider Interface"]
 
     C --> D["AWS Secrets Manager"]
+
     C --> E["HashiCorp Vault"]
 
     D --> F["Secret Data"]
+
     E --> F
 
     F --> G["Kubernetes Secret"]
 ```
 
 The controller is designed around a provider interface so that adding another secret management system does not require changing the core reconciliation logic.
+
+---
+
+<!-- CHANGED: New architectural explanation. -->
+
+## Why a CRD and Operator Instead of a CronJob?
+
+A periodic synchronization task could be implemented using a Kubernetes `CronJob`. However, this project uses a **Custom Resource Definition (CRD) and Kubernetes controller** because the synchronization is modeled as a continuously managed Kubernetes resource rather than as a scheduled batch job.
+
+With a `CronJob`, the schedule is the primary abstraction:
+
+```text
+CronJob
+   │
+   ├── starts Job
+   │
+   └── Job retrieves secret
+          │
+          └── updates Kubernetes Secret
+```
+
+With the operator, the desired synchronization is represented directly as a Kubernetes resource:
+
+```text
+SecretSync CR
+      │
+      ▼
+SecretSync Controller
+      │
+      ├── retrieves external secret
+      │
+      ├── compares desired state
+      │
+      └── creates/updates Kubernetes Secret
+```
+
+This approach provides several advantages:
+
+### Declarative configuration
+
+The `SecretSync` resource describes the desired relationship:
+
+* which provider to use
+* which external secret to retrieve
+* which Kubernetes Secret should contain the data
+* how frequently the resource should be refreshed
+
+The synchronization configuration becomes part of the Kubernetes API rather than being embedded in a scheduled script or Job.
+
+### Continuous reconciliation
+
+Kubernetes controllers are designed around reconciliation: the controller repeatedly compares the desired state with the current state and takes action when they differ.
+
+For example, if the target Kubernetes Secret is deleted manually, the controller can recreate it during the next reconciliation.
+
+Similarly, if the external secret changes, the controller can update the Kubernetes Secret during its next refresh.
+
+### Event-driven and periodic behavior
+
+The controller can react to Kubernetes events such as creation or modification of a `SecretSync`, while also periodically rechecking the external secret.
+
+The `refreshInterval` field controls the periodic reconciliation interval:
+
+```yaml
+spec:
+  refreshInterval: 10m
+```
+
+If `refreshInterval` is not specified, the controller uses a default interval of **5 minutes**.
+
+This combines Kubernetes event-driven reconciliation with periodic synchronization of an external system.
+
+### Kubernetes-native resource model
+
+A `SecretSync` can be inspected and managed using normal Kubernetes tooling:
+
+```bash
+kubectl get secretsync
+kubectl describe secretsync database-sync
+kubectl get secretsync database-sync -o yaml
+```
+
+The synchronization status is also reported through the `SecretSync` status and its `Ready` condition.
+
+### Separation of scheduling from synchronization logic
+
+A `CronJob` primarily answers:
+
+> "When should this Job run?"
+
+The operator instead models:
+
+> "This external secret should continuously be synchronized into this Kubernetes Secret."
+
+The controller owns the synchronization lifecycle and can determine whether an update is actually necessary before modifying the target Secret.
+
+A `CronJob` remains a valid solution for simpler one-off or scheduled tasks. The CRD/operator approach is used here because the synchronization itself is treated as a Kubernetes resource with a desired state that should continuously be reconciled.
 
 ---
 
@@ -43,6 +143,7 @@ A `SecretSync` resource defines:
 1. **Which provider** should be used.
 2. **Which external secret** should be retrieved.
 3. **Which Kubernetes Secret** should contain the synchronized data.
+4. **How frequently** the external secret should be checked.
 
 For example:
 
@@ -52,10 +153,14 @@ kind: SecretSync
 metadata:
   name: database-sync
 spec:
+  refreshInterval: 10m
+
   provider:
     type: aws
+
   remote:
     name: production/database
+
   target:
     name: database-secret
 ```
@@ -64,6 +169,7 @@ The reconciliation flow is:
 
 ```mermaid
 sequenceDiagram
+
     participant K as Kubernetes
     participant C as Controller
     participant P as Provider
@@ -75,9 +181,12 @@ sequenceDiagram
     E-->>P: Secret data
     P-->>C: Secret data
     C->>K: Create/Update target Secret
+    C->>C: Requeue after refresh interval
 ```
 
 If the target Secret already contains the desired data, the controller does not update it.
+
+The controller periodically reconciles the resource according to `spec.refreshInterval`. If no interval is specified, a default interval of **5 minutes** is used.
 
 ---
 
@@ -99,26 +208,54 @@ metadata:
   name: database-sync
   namespace: default
 spec:
+  refreshInterval: 10m
+
   provider:
     type: aws
+
   remote:
     name: production/database
+
   target:
     name: database-secret
 ```
 
 ### Specification
 
-| Field                  | Description                                      |
-| ---------------------- | ------------------------------------------------ |
-| `spec.provider.type`   | External secret provider to use                  |
-| `spec.provider.config` | Optional provider-specific configuration         |
-| `spec.remote.name`     | Name/key of the secret in the external provider  |
-| `spec.target.name`     | Name of the Kubernetes `Secret` to create/update |
+| Field                  | Description                                                                             |
+| ---------------------- | --------------------------------------------------------------------------------------- |
+| `spec.refreshInterval` | Optional interval between periodic reconciliations. Defaults to 5 minutes when omitted. |
+| `spec.provider.type`   | External secret provider to use                                                         |
+| `spec.provider.config` | Optional provider-specific configuration                                                |
+| `spec.remote.name`     | Name/key of the secret in the external provider                                         |
+| `spec.target.name`     | Name of the Kubernetes `Secret` to create/update                                        |
 
 The target Kubernetes `Secret` is created in the **same namespace as the `SecretSync` resource**.
 
 Provider configuration is passed to the provider implementation, allowing each provider to determine how its configuration and authentication should be handled.
+
+### Refresh Interval
+
+The `refreshInterval` field controls how frequently the controller rechecks the external secret.
+
+For example:
+
+```yaml
+spec:
+  refreshInterval: 10m
+```
+
+Supported Kubernetes duration values can be used, such as:
+
+```yaml
+refreshInterval: 5m
+refreshInterval: 10m
+refreshInterval: 1h
+```
+
+If the field is omitted, the controller uses a default refresh interval of **5 minutes**.
+
+The interval affects periodic reconciliation. The controller can also reconcile immediately when Kubernetes events trigger reconciliation, such as when the `SecretSync` resource is created or modified.
 
 ---
 
@@ -132,35 +269,49 @@ flowchart TB
     CR["SecretSync Custom Resource"]
 
     subgraph Operator["Secret Sync Operator"]
+
         Controller["SecretSync Controller"]
+
         Provider["Provider Interface"]
+
     end
 
     subgraph Providers["Providers"]
+
         AWS["AWS Provider"]
+
         Vault["Vault Provider"]
+
     end
 
     subgraph External["External Secret Managers"]
+
         AWS_SM["AWS Secrets Manager"]
+
         Vault_SM["HashiCorp Vault"]
+
     end
 
     K8S["Kubernetes Secret"]
 
     CR --> Controller
+
     Controller --> Provider
 
     Provider --> AWS
+
     Provider --> Vault
 
     AWS --> AWS_SM
+
     Vault --> Vault_SM
 
     AWS_SM --> AWS
+
     Vault_SM --> Vault
 
     Provider --> Controller
+
     Controller --> K8S
 ```
 
@@ -178,6 +329,7 @@ The project follows the standard Kubebuilder layout:
 
 ```text
 secret-sync-operator/
+
 ├── api/
 │   └── v1alpha1/
 │       ├── secretsync_types.go
@@ -247,6 +399,7 @@ Current implementations include:
 
 ```mermaid
 classDiagram
+
     class Provider {
         <<interface>>
         GetSecret(ctx, key)
@@ -290,16 +443,20 @@ Conceptually:
 
 ```text
 AWS Secrets Manager
+
         │
         │ GetSecretValue
         ▼
+
 {
   "username": "admin",
   "password": "example-password",
   "host": "database.example.com"
 }
+
         │
         ▼
+
 Kubernetes Secret
         │
         ├── username
@@ -339,8 +496,10 @@ spec:
         type: token
         tokenSecretRef:
           name: vault-token
+
   remote:
     name: database
+
   target:
     name: database-secret
 ```
@@ -477,6 +636,7 @@ Clone the repository and enter the project directory:
 
 ```bash
 git clone <repository-url>
+
 cd secret-sync-operator
 ```
 
@@ -506,7 +666,9 @@ LocalStack is used to provide a local AWS Secrets Manager environment without re
 
 ```mermaid
 flowchart LR
+
     Test["Integration Test"] --> LS["LocalStack"]
+
     LS --> SM["Secrets Manager API"]
 ```
 
@@ -677,10 +839,14 @@ kind: SecretSync
 metadata:
   name: database-sync
 spec:
+  refreshInterval: 10m
+
   provider:
     type: aws
+
   remote:
     name: test-secret
+
   target:
     name: database-secret
 ```
@@ -735,6 +901,8 @@ metadata:
   name: vault-database-sync
   namespace: default
 spec:
+  refreshInterval: 10m
+
   provider:
     type: vault
     config:
@@ -744,8 +912,10 @@ spec:
         type: token
         tokenSecretRef:
           name: vault-token
+
   remote:
     name: test-secret
+
   target:
     name: database-secret
 ```
@@ -805,6 +975,10 @@ The operator updates the target Secret so that its data matches the external sec
 
 The operator does not update the target Secret.
 
+In all successful synchronization cases, the controller schedules the next periodic reconciliation according to `spec.refreshInterval`.
+
+If `spec.refreshInterval` is omitted, the default interval is **5 minutes**.
+
 The `SecretSync` status reports the synchronization result using a `Ready` condition.
 
 ---
@@ -815,16 +989,25 @@ For AWS:
 
 ```mermaid
 flowchart TB
+
     User["Developer"]
 
     User -->|"Creates SecretSync"| CR["SecretSync CR"]
+
     CR --> Controller["SecretSync Controller"]
+
     Controller --> Provider["AWS Provider"]
+
     Provider --> LocalStack["LocalStack"]
+
     LocalStack --> SecretsManager["AWS Secrets Manager API"]
+
     SecretsManager --> Secret["External Secret"]
+
     Secret --> Provider
+
     Provider --> Controller
+
     Controller --> KubernetesSecret["Kubernetes Secret"]
 ```
 
@@ -832,27 +1015,33 @@ For Vault:
 
 ```mermaid
 flowchart TB
+
     User["Developer"]
 
     User -->|"Creates SecretSync"| CR["SecretSync CR"]
+
     CR --> Controller["SecretSync Controller"]
 
     Controller --> VaultProvider["Vault Provider"]
+
     VaultProvider --> Auth["Vault Authentication"]
 
     Auth --> TokenSecret["Kubernetes Token Secret"]
+
     VaultProvider --> Vault["HashiCorp Vault KV v2"]
 
     Vault --> Secret["External Secret"]
+
     Secret --> VaultProvider
 
     VaultProvider --> Controller
+
     Controller --> KubernetesSecret["Kubernetes Secret"]
 ```
 
 The important part is that the secret value itself is **not stored in the `SecretSync` resource**.
 
-The `SecretSync` only describes where the secret should come from and where it should be synchronized.
+The `SecretSync` only describes where the secret should come from, where it should be synchronized, and how frequently it should be refreshed.
 
 ---
 
@@ -956,10 +1145,15 @@ The basic flow is:
 
 ```mermaid
 flowchart LR
+
     Source["Git Repository"] --> Build["Build Docker Image"]
+
     Build --> Image["Controller Image"]
+
     Image --> Cluster["Kubernetes Cluster"]
+
     Source --> Manifests["Kubernetes Manifests"]
+
     Manifests --> Cluster
 ```
 

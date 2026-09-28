@@ -19,6 +19,7 @@ package controller
 import (
 	"bytes"
 	"context"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,6 +38,20 @@ type SecretSyncReconciler struct {
 	client.Client
 	Scheme          *runtime.Scheme
 	ProviderFactory provider.Factory
+}
+
+// defaultRefreshInterval sets defulat time to reconcile every 5 minutes
+// if the user does not specify refreshInterval in the SecretSync.
+const defaultRefreshInterval = 5 * time.Minute
+
+// getRefreshInterval returns the refresh interval configured by the user,
+// or the default 5 minutes when no valid interval is configured.
+func getRefreshInterval(secretSync *opsv1alpha1.SecretSync) time.Duration {
+	if secretSync.Spec.RefreshInterval.Duration <= 0 {
+		return defaultRefreshInterval
+	}
+
+	return secretSync.Spec.RefreshInterval.Duration
 }
 
 // +kubebuilder:rbac:groups=ops.example.com,resources=secretsyncs,verbs=get;list;watch;create;update;patch;delete
@@ -68,6 +83,10 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 
 		return ctrl.Result{}, err
 	}
+
+	// Calculate the effective refresh interval once the
+	// SecretSync has been retrieved
+	refreshInterval := getRefreshInterval(&secretSync)
 
 	// 2. Get the provider configured in the SecretSync resource.
 	secretProvider, err := r.ProviderFactory.GetProvider(
@@ -150,7 +169,10 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 				return ctrl.Result{}, err
 			}
 
-			return ctrl.Result{}, nil
+			// refresh interval after successfully creating the Secret
+			return ctrl.Result{
+				RequeueAfter: refreshInterval,
+			}, nil
 		}
 		return ctrl.Result{}, err
 	}
@@ -169,7 +191,12 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			return ctrl.Result{}, err
 		}
 
-		return ctrl.Result{}, nil
+		// Requeue even when the Secret is already up to date.
+		// Without this, the controller would stop checking the external
+		// provider after this successful reconciliation.
+		return ctrl.Result{
+			RequeueAfter: refreshInterval,
+		}, nil
 	}
 
 	// 4.c If the target Secret data differs from the remote secret, update it.
@@ -192,7 +219,12 @@ func (r *SecretSyncReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, nil
+	// Requeue after successfully updating the Secret so the
+	// controller checks the external provider again after the configured
+	// interval.
+	return ctrl.Result{
+		RequeueAfter: refreshInterval,
+	}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

@@ -31,6 +31,9 @@ type SecretSyncSpec struct {
 	Provider ProviderSpec `json:"provider"`
 	Remote   RemoteSpec   `json:"remote"`
 	Target   TargetSpec   `json:"target"`
+
+	// +optional
+	RefreshInterval metav1.Duration `json:"refreshInterval,omitempty"`
 }
 
 type ProviderSpec struct {

@@ -18,6 +18,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -148,10 +149,12 @@ var _ = Describe("SecretSync Controller", func() {
 				ProviderFactory: fakeFactory,
 			}
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
+
+			Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
 
 			var targetSecret corev1.Secret
 
@@ -234,15 +237,17 @@ var _ = Describe("SecretSync Controller", func() {
 
 			By("reconciling the resource")
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 
 			Expect(err).NotTo(HaveOccurred())
 
+			Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
 			By("verifying the target secret")
 
-			var result corev1.Secret
+			var resultSecret corev1.Secret
 
 			Expect(k8sClient.Get(
 				ctx,
@@ -250,10 +255,10 @@ var _ = Describe("SecretSync Controller", func() {
 					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
-				&result,
+				&resultSecret,
 			)).To(Succeed())
 
-			Expect(result.Data).To(Equal(map[string][]byte{
+			Expect(resultSecret.Data).To(Equal(map[string][]byte{
 				usernameKey: []byte("admin"),
 				passwordKey: []byte("new-password"),
 			}))
@@ -315,15 +320,17 @@ var _ = Describe("SecretSync Controller", func() {
 
 			By("reconciling the resource")
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
 				NamespacedName: typeNamespacedName,
 			})
 
 			Expect(err).NotTo(HaveOccurred())
 
+			Expect(result.RequeueAfter).To(Equal(5 * time.Minute))
+
 			By("verifying the target secret was updated")
 
-			var result corev1.Secret
+			var resultSecret corev1.Secret
 
 			Expect(k8sClient.Get(
 				ctx,
@@ -331,10 +338,10 @@ var _ = Describe("SecretSync Controller", func() {
 					Name:      testTargetSecretName,
 					Namespace: resourceNamespace,
 				},
-				&result,
+				&resultSecret,
 			)).To(Succeed())
 
-			Expect(result.Data).To(Equal(map[string][]byte{
+			Expect(resultSecret.Data).To(Equal(map[string][]byte{
 				usernameKey: []byte("admin"),
 				passwordKey: []byte("new-password"),
 			}))
@@ -357,6 +364,53 @@ var _ = Describe("SecretSync Controller", func() {
 			Expect(condition.Status).To(Equal(metav1.ConditionTrue))
 			Expect(condition.Reason).To(Equal("SecretSynced"))
 			Expect(condition.Message).To(Equal("Secret successfully synchronized"))
+		})
+
+		It("should use the configured refresh interval", func() {
+			By("configuring a 10-minute refresh interval")
+
+			var secretSync opsv1alpha1.SecretSync
+
+			Expect(k8sClient.Get(
+				ctx,
+				typeNamespacedName,
+				&secretSync,
+			)).To(Succeed())
+
+			secretSync.Spec.RefreshInterval = metav1.Duration{
+				Duration: 10 * time.Minute,
+			}
+
+			Expect(k8sClient.Update(ctx, &secretSync)).To(Succeed())
+
+			fakeProvider := &FakeSecretProvider{
+				Data: map[string][]byte{
+					usernameKey: []byte("admin"),
+					passwordKey: []byte("new-password"),
+				},
+			}
+
+			fakeFactory := &FakeProviderFactory{
+				Provider: fakeProvider,
+			}
+
+			controllerReconciler := &SecretSyncReconciler{
+				Client:          k8sClient,
+				Scheme:          k8sClient.Scheme(),
+				ProviderFactory: fakeFactory,
+			}
+
+			By("reconciling the resource")
+
+			result, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: typeNamespacedName,
+			})
+
+			Expect(err).NotTo(HaveOccurred())
+
+			By("verifying the configured refresh interval is returned")
+
+			Expect(result.RequeueAfter).To(Equal(10 * time.Minute))
 		})
 
 		It("should return an error when the provider is unsupported", func() {
